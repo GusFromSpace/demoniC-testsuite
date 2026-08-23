@@ -1,0 +1,192 @@
+# port_python.dmc -- the process-port floor (PORTS.md §7.1) end to end.
+# Demonstrates: open a python runtime, call stdlib functions across every
+# argument mode of the JSON ABI, read the canonical-JSON results back (as text
+# or through a typed decode), handle the error tags, and close. No new syntax
+# -- port_open/port_call/port_close are ordinary fallible builtins
+# (SPEC.md §4.11).
+#
+# The argument ABI (PORTS.md §2). The `payload` str decodes to:
+#   - null / empty  -> the function is called with no arguments.
+#   - a JSON array  -> its elements are the positional arguments, spread.
+#   - a JSON object -> the {args, kwargs} envelope: `args` spread positionally,
+#                      `kwargs` spread by name.
+#   - anything else (a bare number/string/bool) -> `port-protocol`: wrap it.
+# A single argument is therefore a one-element array; a top-level object is
+# always the envelope, so an object *argument* nests inside the array and is
+# never mistaken for it.
+#
+# Payloads below are written as the JSON text that actually crosses the pipe,
+# so what you read here is what the runtime receives. Building one from
+# demoniC values instead -- `map()` / `list()` / `json_encode` -- is what
+# port_bridge.dmc shows.
+#
+# Run: dmc run examples/port_python.dmc   (python3 is a dev prerequisite)
+#      dmc jit examples/port_python.dmc   (both backends drive the same port)
+
+# Encode a two-element positional argument vector [a, b] as canonical JSON.
+fn pos2(a: i64, b: i64) -> str {
+    "[" + to_str(a) + "," + to_str(b) + "]"
+}
+
+fn main() -> str {
+    let (p, e1) = port_open("python")
+    if e1 != nil {
+        print("port open failed: " + e1)
+        return e1
+    }
+
+    # Two positional arguments, spread from the array: math.gcd(462, 1071).
+    # demoniC owns tensor kernels; the integer stdlib it ports out for.
+    let (g, e2) = port_call(p, "math.gcd", pos2(462, 1071))
+    if e2 != nil {
+        print("gcd failed: " + e2)
+        let (_, _) = port_close(p)
+        return e2
+    }
+    print("gcd(462, 1071) = " + g)     # -> 21
+
+    # A keyword argument through the envelope: sorted([3, 1, 2], reverse=true).
+    # The list is one positional arg, so it nests one level inside `args`.
+    let (s, e3) = port_call(p, "sorted",
+        "{\"args\": [[3, 1, 2]], \"kwargs\": {\"reverse\": true}}")
+    if e3 != nil {
+        print("sort failed: " + e3)
+        let (_, _) = port_close(p)
+        return e3
+    }
+    print("sorted desc = " + s)        # -> [3,2,1]
+
+    let (_, e4) = port_close(p)
+    if e4 != nil { return e4 }
+    g
+}
+
+# --- tests ---
+# Every assertion below opens its own port, so each is a self-contained
+# statement about one ABI mode or one error tag. The result str is always
+# canonical JSON, re-encoded by demoniC's own writer, so whole floats print
+# without a trailing `.0` (1024.0 -> "1024") -- assertions rely on that.
+
+# No arguments: a null/empty payload calls the function with no args.
+# `list()` in python (a bare builtin) yields the empty list.
+fn test_no_args_calls_niladic() -> bool {
+    let (p, _) = port_open("python")
+    let (out, err) = port_call(p, "list", nil)
+    let (_, _) = port_close(p)
+    err == nil && out == "[]"
+}
+
+# One positional argument is a one-element array: sum([1, 2, 3]) == 6.
+# The list is the single argument, so it nests inside the payload array.
+fn test_single_arg_nests_in_array() -> bool {
+    let (p, _) = port_open("python")
+    let (out, err) = port_call(p, "sum", "[[1, 2, 3]]")
+    let (_, _) = port_close(p)
+    err == nil && out == "6"
+}
+
+# Multiple positional arguments spread from the array: math.pow(2, 10).
+# The whole-float result 1024.0 re-encodes as "1024".
+fn test_multi_arg_spreads() -> bool {
+    let (p, _) = port_open("python")
+    let (out, err) = port_call(p, "math.pow", pos2(2, 10))
+    let (_, _) = port_close(p)
+    err == nil && out == "1024"
+}
+
+# Keyword arguments through the {args, kwargs} envelope:
+# round(3.14159, ndigits=2) == 3.14.
+fn test_kwargs_envelope() -> bool {
+    let (p, _) = port_open("python")
+    let (out, err) = port_call(p, "round",
+        "{\"args\": [3.14159], \"kwargs\": {\"ndigits\": 2}}")
+    let (_, _) = port_close(p)
+    err == nil && out == "3.14"
+}
+
+# A foreign exception (sqrt of a string) surfaces as a `port-call` tag and
+# leaves the port alive -- code matches only the tag prefix (PORTS.md §6).
+fn test_foreign_exception_tags_port_call() -> bool {
+    let (p, _) = port_open("python")
+    let (out, err) = port_call(p, "math.sqrt", "[\"sixteen\"]")
+    # The port survives the foreign exception: the next call still answers.
+    let (again, err2) = port_call(p, "math.gcd", pos2(462, 1071))
+    let (_, _) = port_close(p)
+    err != nil && err.starts_with("port-call") && out == "" && again == "21" && err2 == nil
+}
+
+# A bare scalar payload is not an argument vector: the ABI rejects it with
+# `port-protocol` rather than guessing. Wrapping it in `[...]` is the fix.
+fn test_bare_scalar_tags_port_protocol() -> bool {
+    let (p, _) = port_open("python")
+    let (out, err) = port_call(p, "math.sqrt", "16")   # scalar, not [16]
+    let (_, _) = port_close(p)
+    err != nil && err.starts_with("port-protocol") && out == ""
+}
+
+# An unsupported runtime is reported, not faked: only `python` is wired up.
+# The handle half of the pair is nil, so nothing downstream can use it.
+fn test_unsupported_runtime_tags_port_open() -> bool {
+    let (p, err) = port_open("lua")
+    p == nil && err != nil && err.starts_with("port-open")
+}
+
+# Closing twice is `port-closed`, not a crash and not silence: handle ids are
+# never reused, so a stale handle can never reach a later port.
+fn test_double_close_tags_port_closed() -> bool {
+    let (p, _) = port_open("python")
+    let (_, first) = port_close(p)
+    let (_, second) = port_close(p)
+    first == nil && second != nil && second.starts_with("port-closed")
+}
+
+# A call on a closed handle is `port-closed` too, and it does not reach the
+# port opened after it.
+fn test_call_after_close_tags_port_closed() -> bool {
+    let (p, _) = port_open("python")
+    let (_, _) = port_close(p)
+    let (q, _) = port_open("python")
+    let (out, err) = port_call(p, "len", "[[1, 2, 3]]")
+    let (fresh, ferr) = port_call(q, "len", "[[1, 2, 3]]")
+    let (_, _) = port_close(q)
+    err != nil && err.starts_with("port-closed") && out == ""
+        && fresh == "3" && ferr == nil
+}
+
+# A handle may be passed and returned (SPEC.md 3.11), so `Port[python]` is
+# writable in a signature: the port can be opened in one function and called
+# from another, and it is the same live port on the other side. The handle
+# itself stays opaque -- it compares only against nil, and a plain str is not
+# one, so nothing can forge a handle it never opened.
+fn ask_len(q: Port[python], payload: str) -> str {
+    let (out, _) = port_call(q, "len", payload)
+    out
+}
+
+fn test_handle_crosses_a_function_boundary() -> bool {
+    let (p, e) = port_open("python")
+    let a = ask_len(p, "[[1, 2, 3]]")
+    let b = ask_len(p, "[\"abcd\"]")
+    let (_, _) = port_close(p)
+    e == nil && p != nil && a == "3" && b == "4"
+}
+
+# Escaping is the port's job, not the caller's: a payload string carrying a
+# quote and a newline crosses intact, so python counts the 12 characters of
+# `he said "hi"` plus the newline -- 13, not a mangled frame.
+fn test_quoted_payload_survives_the_frame() -> bool {
+    let (p, _) = port_open("python")
+    let (out, err) = port_call(p, "len", "[\"he said \\\"hi\\\"\\n\"]")
+    # The frame stayed in sync: the very next call still answers correctly.
+    let (after, aerr) = port_call(p, "len", "[[1, 2, 3]]")
+    let (_, _) = port_close(p)
+    err == nil && out == "13" && after == "3" && aerr == nil
+}
+
+# Payloads built out of demoniC values -- `list()` / `list_push` / `map()` /
+# `map_set` / `json_encode` -- and the typed decode of a result back into one
+# live in port_payloads.dmc. They are the other half of this boundary and are
+# covered, just not here: those builtins are outside the JIT's lowered subset,
+# so a file using them is refused by `dmc jit` whole. Splitting them keeps this
+# file a real `dmc test --jit` gate on the port lowering instead of averaging a
+# gate with a refusal into one number.

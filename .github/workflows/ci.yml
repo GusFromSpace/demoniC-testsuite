@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Watch the public demoniC compiler: rebuild against its current main
+    # daily and fail loudly if the suite stops passing under it.
+    - cron: "25 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  suite:
+    name: Build dmc, run the battery
+    runs-on: ubuntu-latest
+    env:
+      DMC: ${{ github.workspace }}/.dmc-build/compiler/target/release/dmc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build dmc from the public demoniC repo
+        run: |
+          git clone --depth 1 https://github.com/GusFromSpace/demoniC .dmc-build
+          cargo build --release --manifest-path .dmc-build/compiler/Cargo.toml
+      - name: dmc selftest
+        # Compiler-derived differential suite: generated programs run through
+        # both backends (interpreter and JIT), diffed for divergence.
+        run: '"$DMC" selftest'
+      - name: dmc test examples
+        # The in-language ground-truth suite over the corpus.
+        run: '"$DMC" test examples'
+      - name: dmc test --jit examples
+        # Every JIT-eligible test additionally runs on both backends and the
+        # results are compared.
+        run: '"$DMC" test --jit examples'
+      - name: example_runner.py (per-example conformance)
+        # Each example gated individually against tools/example_baseline.json
+        # by its executable test results on both backends. To record a
+        # genuinely-new passing example: python3 tools/example_runner.py
+        # --accept-new, and commit the baseline change.
+        run: python3 tools/example_runner.py --dmc "$DMC"
+      - name: diff_backends.py (run-vs-jit whole-example diff)
+        # Diffs full program output between the interpreter and the JIT. The
+        # interpreter is the reference semantics, so any unexplained
+        # divergence is a JIT bug.
+        run: python3 tools/diff_backends.py --dmc "$DMC"
+      - name: jit_probes.py (run-vs-jit edge-case battery)
+        # Curated edge cases the example corpus does not reach.
+        run: python3 tools/jit_probes.py --dmc "$DMC"
+      - name: lint_dmc.py
+        # Style/consistency lints over the .dmc corpus.
+        run: python3 tools/lint_dmc.py
+      - name: diff_fuzz.py (smoke)
+        # Structure-aware interp-vs-jit differential fuzzer: generates
+        # well-typed scalar programs, runs both backends, diffs.
+        run: python3 tools/diff_fuzz.py --dmc "$DMC" --iters 2000 --meta-test
+      - name: Install numpy
+        run: pip install numpy
+      - name: numpy_oracle.py
+        # External source of truth: tensor ops checked against an independent
+        # NumPy reimplementation (catches bugs shared by both backends).
+        run: python3 tools/numpy_oracle.py --dmc "$DMC" --meta-test

@@ -1,0 +1,8 @@
+__pycache__/
+.DS_Store
+
+# Local dmc build clone made by the CI recipe / README instructions.
+.dmc-build/
+
+# Generator bookkeeping — present in a freshly built tree, never committed.
+.demonic-publish-tree
