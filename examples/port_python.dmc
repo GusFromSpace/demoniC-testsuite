@@ -183,6 +183,131 @@ fn test_quoted_payload_survives_the_frame() -> bool {
     err == nil && out == "13" && after == "3" && aerr == nil
 }
 
+# --- tensor copy mode (PORTS.md 3.2) ---
+# A tensor does NOT implicitly become a JSON array: that would hide the
+# allocation and erase the shape. It crosses as one canonical-JSON object --
+# the tensor envelope -- carrying `{dtype, shape, layout}` plus the payload
+# buffer as base64:
+#
+#   {"data":"<base64>","dmc_tensor":1,"dtype":"i64",
+#    "layout":"row_major","shape":[2,3]}
+#
+# `port_tensor_encode(t)` writes one; `port_tensor_decode(s, like)` reads one,
+# with `like` declaring the dtype and shape that were expected. The envelope is
+# ordinary JSON text, so it composes with the payload rules above: a tensor
+# argument is one element of the argument vector, `[ <envelope> ]`.
+#
+# Where numpy is installed, the port harness rehydrates the envelope into an
+# ndarray, so real numpy is one call away and needs nothing at the call site:
+#
+#   let (out, e) = port_call(p, "numpy.transpose", "[" + port_tensor_encode(g) + "]")
+#   let (t, e2)  = port_tensor_decode(out, forge.zeros[i64, [3, 2]])
+#
+# The tests below deliberately do not use numpy: they gate the format itself,
+# and the format is demoniC's, not numpy's.
+
+# The envelope is the ABI, so this pins its exact bytes -- key order included.
+# Keys are in the canonical writer's order, which is why an envelope demoniC
+# wrote and one that comes back through `port_call` are the same text.
+fn test_tensor_encode_is_the_wire_format() -> bool {
+    let !g = forge.zeros[i64, [2, 3]]
+    g[0, 0] = 1
+    g[0, 1] = 2
+    g[0, 2] = 3
+    g[1, 0] = -4
+    g[1, 1] = 5
+    g[1, 2] = 6
+    let want = "{\"data\":\"AQAAAAAAAAACAAAAAAAAAAMAAAAAAAAA"
+        + "/P////////8FAAAAAAAAAAYAAAAAAAAA\","
+        + "\"dmc_tensor\":1,\"dtype\":\"i64\","
+        + "\"layout\":\"row_major\",\"shape\":[2,3]}"
+    port_tensor_encode(g) == want
+}
+
+# The `dtype` on the wire always states the width of the bytes actually in
+# `data`. A bool tensor is 1 byte per element, so three bools are three bytes
+# ("AQAB"), not a widened stand-in. A `dtype` naming a type wider than its
+# payload is how a 2-byte source ends up read into a 4-byte buffer, with every
+# consumer striding it 2x and running off the end -- a real weight-loading
+# failure mode, refused here at the port boundary.
+fn test_tensor_dtype_states_the_payload_width() -> bool {
+    let !b = forge.uninit[bool, [3]]
+    b[0] = true
+    b[1] = false
+    b[2] = true
+    let want = "{\"data\":\"AQAB\",\"dmc_tensor\":1,\"dtype\":\"bool\","
+        + "\"layout\":\"row_major\",\"shape\":[3]}"
+    port_tensor_encode(b) == want
+}
+
+# Values, shape and dtype all survive a round trip through the envelope.
+fn test_tensor_round_trips_through_the_envelope() -> bool {
+    let !g = forge.zeros[i64, [2, 2]]
+    g[0, 0] = 10
+    g[0, 1] = -20
+    g[1, 0] = 30
+    g[1, 1] = -40
+    let (back, err) = port_tensor_decode(port_tensor_encode(g), forge.zeros[i64, [2, 2]])
+    err == nil && back[0, 1] == -20 && back[1, 0] == 30 && back[1, 1] == -40
+}
+
+# A decode is typed, so it never coerces: a shape the caller did not declare
+# and a float envelope read as an integer tensor are both `decode-type`. The
+# tags are the 3.1 decode family, not the `port-` family -- decoding happens
+# after the call returned, so a bad envelope is a contract failure, not a port
+# that failed. The value half is the declared tensor's zero.
+fn test_tensor_decode_refuses_what_it_did_not_declare() -> bool {
+    let !g = forge.zeros[i64, [4]]
+    let (short, e1) = port_tensor_decode(port_tensor_encode(g), forge.zeros[i64, [2]])
+    let !f = forge.zeros[f32, [2]]
+    let (wrong, e2) = port_tensor_decode(port_tensor_encode(f), forge.zeros[i64, [2]])
+    let (junk, e3) = port_tensor_decode("{oops", forge.zeros[i64, [2]])
+    e1 == "decode-type: expected tensor shape [2], got [4]"
+        && e2 == "decode-type: expected a `i64` tensor, got `f32`"
+        && e3.starts_with("decode-parse")
+        && short[0] == 0 && junk[0] == 0
+}
+
+# The whole loop through a live port: encode, send the envelope as the single
+# positional argument, let python hand it back, decode it. The `dmc.*` names
+# are served by the port harness itself, so a copy-mode round trip needs no
+# third-party runtime; `dmc.shape` answers from the *rehydrated* tensor, which
+# is how this proves the far side parsed the envelope rather than echoing text.
+fn test_tensor_crosses_the_port_by_copy() -> bool {
+    let (p, e1) = port_open("python")
+    let !g = forge.zeros[i64, [2, 2]]
+    g[0, 0] = 1
+    g[0, 1] = 2
+    g[1, 0] = 3
+    g[1, 1] = 4
+    let (out, e2) = port_call(p, "dmc.echo", "[" + port_tensor_encode(g) + "]")
+    let (dims, e3) = port_call(p, "dmc.shape", "[" + port_tensor_encode(g) + "]")
+    let (_, e4) = port_close(p)
+    let (back, e5) = port_tensor_decode(out, forge.zeros[i64, [2, 2]])
+    e1 == nil && e2 == nil && e3 == nil && e5 == nil
+        && dims == "[2,2]"
+        && back[0, 0] + back[0, 1] + back[1, 0] + back[1, 1] == 10
+}
+
+# The envelope is manifest-strict on its fields, not descriptor-additive: the
+# five PORTS.md 3.2 defines are all of them. A key nobody defined is a document
+# written to a format this reader does not know, and reading the rest of it
+# anyway would be reading someone else's numbers. Both readers refuse it, and
+# the tags differ by *where*: locally it is a `decode-type` (a caller contract),
+# but an envelope sent to a runtime dies inside the ABI before any foreign code
+# runs, which is `port-protocol`.
+fn test_an_unknown_envelope_field_is_refused_on_both_sides() -> bool {
+    let bad = "{\"data\":\"AQAAAAAAAAACAAAAAAAAAA==\",\"dmc_tensor\":1,"
+        + "\"dtype\":\"i64\",\"evil\":1,\"layout\":\"row_major\",\"shape\":[2]}"
+    let (here, e1) = port_tensor_decode(bad, forge.zeros[i64, [2]])
+    let (p, e2) = port_open("python")
+    let (_, e3) = port_call(p, "dmc.echo", "[" + bad + "]")
+    let (_, e4) = port_close(p)
+    e1 == "decode-type: tensor envelope has unknown field(s) `evil`"
+        && e3 == "port-protocol: tensor envelope has unknown field(s) 'evil'"
+        && here[0] == 0
+}
+
 # Payloads built out of demoniC values -- `list()` / `list_push` / `map()` /
 # `map_set` / `json_encode` -- and the typed decode of a result back into one
 # live in port_payloads.dmc. They are the other half of this boundary and are
